@@ -35,20 +35,38 @@ echo !CPU_NAME! | findstr /r "1[0-9][0-9][HU]" >nul
 if !errorlevel!==0 (
     echo Processor: Intel Core Ultra Series 1 - Meteor Lake
     set IPEX_LLM_NPU_MTL=1
-) else (
-    echo !CPU_NAME! | findstr /i "Ultra" >nul
-    if !errorlevel!==0 (
-        echo Processor: Intel Core Ultra Series 2 / Lunar Lake
-    ) else (
-        echo WARNING: Intel Core Ultra processor not detected
-        echo This software requires an Intel Core Ultra with NPU
-    )
+    set NPU_GENERATION=METEOR_LAKE
+    goto :npu_detected
 )
 
+REM Check for Lunar Lake (2xxV models)
+echo !CPU_NAME! | findstr /r "2[0-9][0-9]V" >nul
+if !errorlevel!==0 (
+    echo Processor: Intel Core Ultra - Lunar Lake (~48 TOPS NPU)
+    set NPU_GENERATION=LUNAR_LAKE
+    goto :npu_detected
+)
+
+REM Check for other Core Ultra (Arrow Lake, etc)
+echo !CPU_NAME! | findstr /i "Ultra" >nul
+if !errorlevel!==0 (
+    echo Processor: Intel Core Ultra Series 2 - Arrow Lake
+    set NPU_GENERATION=ARROW_LAKE
+    goto :npu_detected
+)
+
+echo WARNING: Intel Core Ultra processor not detected
+echo This software requires an Intel Core Ultra with NPU
+
+:npu_detected
 if defined IPEX_LLM_NPU_MTL (
     echo NPU Config: IPEX_LLM_NPU_MTL=1 - required for Meteor Lake
 ) else (
     echo NPU Config: Native mode
+)
+
+if defined NPU_GENERATION (
+    echo NPU Generation: !NPU_GENERATION!
 )
 echo.
 

@@ -54,6 +54,37 @@ else:
     print("No HuggingFace token found. Gated models (Llama) will not work.")
     print("To use Llama models, create a .env file with: HF_TOKEN=hf_your_token_here")
 
+# --- Hardware Detection ---
+def get_npu_generation():
+    """Detect NPU generation from environment variable."""
+    npu_gen = os.environ.get("NPU_GENERATION", "UNKNOWN")
+    return npu_gen
+
+def is_lunar_lake():
+    """Check if running on Lunar Lake NPU (~48 TOPS)."""
+    return get_npu_generation() == "LUNAR_LAKE"
+
+def get_npu_config():
+    """Get NPU-specific configuration based on hardware generation."""
+    if is_lunar_lake():
+        return {
+            "max_context_len": 4096,
+            "max_prompt_len": 2048,
+            "quantization": "sym_int8",
+            "do_sample": True,
+            "num_beams": 2,
+            "description": "Lunar Lake (~48 TOPS)"
+        }
+    else:
+        return {
+            "max_context_len": 1024,
+            "max_prompt_len": 512,
+            "quantization": "sym_int4",
+            "do_sample": False,
+            "num_beams": 1,
+            "description": "Meteor Lake/Arrow Lake (~11 TOPS)"
+        }
+
 # CRITICAL: Use the NPU-specific model loader!
 from ipex_llm.transformers.npu_model import AutoModelForCausalLM
 from transformers import AutoTokenizer, TextIteratorStreamer
@@ -162,6 +193,18 @@ AVAILABLE_MODELS = {
         "name": "Baichuan2 7B",
         "description": "Chinese-focused LLM (~3 tok/s)"
     },
+    # === LARGER MODELS FOR LUNAR LAKE (~48 TOPS) ===
+    "qwen2.5-14b": {
+        "hf_id": "Qwen/Qwen2.5-14B-Instruct",
+        "name": "Qwen 2.5 14B",
+        "description": "🚀 Lunar Lake optimized (~8 tok/s on 48 TOPS NPU)",
+        "requires_lunar_lake": True
+    },
+    "llama3.1-8b": {
+        "hf_id": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        "name": "Llama 3.1 8B",
+        "description": "Latest Llama with extended context (~5 tok/s)"
+    },
 }
 
 # --- Global State ---
@@ -233,11 +276,25 @@ def load_npu_model(model_id: str, hf_model_path: str):
     print(f"\n{'='*50}")
     print(f"Loading '{model_id}' ({hf_model_path}) for Intel NPU...")
     
+    # Get hardware-specific configuration
+    npu_config = get_npu_config()
+    npu_gen = get_npu_generation()
     npu_env = os.environ.get("IPEX_LLM_NPU_MTL", "not set")
-    print(f" NPU Environment: IPEX_LLM_NPU_MTL={npu_env}")
     
-    # Create cache directory for NPU model
-    model_cache_dir = os.path.join(NPU_MODEL_CACHE, hf_model_path.replace("/", "_"))
+    print(f" NPU Generation: {npu_gen} ({npu_config['description']})")
+    print(f" NPU Environment: IPEX_LLM_NPU_MTL={npu_env}")
+    print(f" Context Window: {npu_config['max_context_len']} tokens (prompt: {npu_config['max_prompt_len']})")
+    print(f" Quantization: {npu_config['quantization']}")
+    
+    # Check if model requires Lunar Lake
+    if model_id in AVAILABLE_MODELS and AVAILABLE_MODELS[model_id].get("requires_lunar_lake", False):
+        if not is_lunar_lake():
+            print(f" WARNING: Model '{model_id}' is optimized for Lunar Lake NPU")
+            print(f"          Performance may be limited on {npu_gen}")
+    
+    # Create cache directory for NPU model (include quantization in path)
+    cache_suffix = npu_config['quantization'].replace('_', '-')
+    model_cache_dir = os.path.join(NPU_MODEL_CACHE, f"{hf_model_path.replace('/', '_')}_{cache_suffix}")
     
     if not os.path.exists(model_cache_dir):
         # Create parent directories and convert model
@@ -249,10 +306,10 @@ def load_npu_model(model_id: str, hf_model_path: str):
             torch_dtype=torch.float16,
             trust_remote_code=True,
             attn_implementation="eager",
-            load_in_low_bit="sym_int4",
+            load_in_low_bit=npu_config['quantization'],
             optimize_model=True,
-            max_context_len=1024,
-            max_prompt_len=512,
+            max_context_len=npu_config['max_context_len'],
+            max_prompt_len=npu_config['max_prompt_len'],
             save_directory=model_cache_dir
         )
         tokenizer = AutoTokenizer.from_pretrained(hf_model_path, trust_remote_code=True)
@@ -313,9 +370,10 @@ def get_model_and_tokenizer(model_id: str):
 async def chat_completions(request: ChatCompletionRequest):
     model, tokenizer = get_model_and_tokenizer(request.model)
     
-    # NPU model context limits (set during compilation)
-    MAX_CONTEXT_LEN = 1024
-    MAX_PROMPT_LEN = 512
+    # Get hardware-specific NPU model context limits
+    npu_config = get_npu_config()
+    MAX_CONTEXT_LEN = npu_config['max_context_len']
+    MAX_PROMPT_LEN = npu_config['max_prompt_len']
     
     # Format prompt (ChatML format for Qwen/compatible models)
     prompt = ""
@@ -335,15 +393,21 @@ async def chat_completions(request: ChatCompletionRequest):
     
     # Cap max_new_tokens to stay within context limit
     available_tokens = MAX_CONTEXT_LEN - input_length - 10  # Leave some buffer
-    max_new_tokens = min(request.max_tokens or 512, available_tokens, 500)
+    # On Lunar Lake, allow up to 2000 tokens output; otherwise cap at 500
+    max_output_cap = 2000 if is_lunar_lake() else 500
+    max_new_tokens = min(request.max_tokens or 512, available_tokens, max_output_cap)
     max_new_tokens = max(max_new_tokens, 10)  # At least 10 tokens
     
-    # Generation config for NPU
+    # Generation config for NPU (hardware-optimized)
     gen_kwargs = dict(
         max_new_tokens=max_new_tokens,
-        do_sample=False,
-        num_beams=1,
+        do_sample=npu_config['do_sample'],
+        num_beams=npu_config['num_beams'],
     )
+    
+    # Add temperature if sampling is enabled (Lunar Lake)
+    if npu_config['do_sample']:
+        gen_kwargs['temperature'] = request.temperature
 
     # --- Streaming Response ---
     if request.stream:
