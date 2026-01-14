@@ -105,9 +105,9 @@ cd /d "%~dp0intel-npu-llm"
 
 REM ---- Start server ----
 if "%~1"=="" (
-    echo Loading default model: qwen1.5-1.8b ^(verified working^)
+    echo Loading default model: qwen2.5-7b ^(verified working with MCP support^)
     echo.
-    python npu_server.py --models "qwen1.5-1.8b"
+    python npu_server.py --models "qwen2.5-7b"
 ) else (
     python npu_server.py %*
 )
