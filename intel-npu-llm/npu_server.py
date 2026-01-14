@@ -17,12 +17,30 @@ import torch
 import json
 import asyncio
 import os
+import logging
+from datetime import datetime
 from pathlib import Path
 from threading import Thread
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+
+# Logging will be configured after parsing command-line arguments
+logger = None
+
+def configure_logging(verbose=False):
+    """Configure logging based on verbose mode."""
+    global logger
+    log_level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        force=True  # Override any existing configuration
+    )
+    logger = logging.getLogger(__name__)
+    return logger
 
 # Load .env file for HuggingFace token
 def load_env_file():
@@ -90,6 +108,27 @@ from ipex_llm.transformers.npu_model import AutoModelForCausalLM
 from transformers import AutoTokenizer, TextIteratorStreamer
 
 app = FastAPI(title="Intel NPU LLM Server")
+
+# Request logging middleware
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    if logger is None:
+        return await call_next(request)
+    
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] {request.method} {request.url.path}")
+    
+    # Log headers (excluding sensitive data)
+    headers = dict(request.headers)
+    safe_headers = {k: v for k, v in headers.items() if k.lower() not in ['authorization', 'cookie']}
+    logger.debug(f"[{request_id}] Headers: {safe_headers}")
+    
+    start_time = time.time()
+    response = await call_next(request)
+    duration = time.time() - start_time
+    
+    logger.info(f"[{request_id}] Status: {response.status_code} | Duration: {duration:.2f}s")
+    return response
 
 # --- Available Models Configuration ---
 # Models verified compatible with ipex-llm NPU (from official docs)
@@ -368,6 +407,18 @@ def get_model_and_tokenizer(model_id: str):
 # --- Routes ---
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] === Chat Completion Request ===")
+    logger.info(f"[{request_id}] Model: {request.model}")
+    logger.info(f"[{request_id}] Stream: {request.stream}")
+    logger.info(f"[{request_id}] Max tokens: {request.max_tokens}")
+    logger.info(f"[{request_id}] Temperature: {request.temperature}")
+    logger.info(f"[{request_id}] Messages count: {len(request.messages)}")
+    
+    for i, msg in enumerate(request.messages):
+        content_preview = msg.content[:100] + "..." if len(msg.content) > 100 else msg.content
+        logger.debug(f"[{request_id}] Message {i} [{msg.role}]: {content_preview}")
+    
     model, tokenizer = get_model_and_tokenizer(request.model)
     
     # Get hardware-specific NPU model context limits
@@ -375,21 +426,27 @@ async def chat_completions(request: ChatCompletionRequest):
     MAX_CONTEXT_LEN = npu_config['max_context_len']
     MAX_PROMPT_LEN = npu_config['max_prompt_len']
     
+    logger.debug(f"[{request_id}] NPU Config: context={MAX_CONTEXT_LEN}, prompt={MAX_PROMPT_LEN}")
+    
     # Format prompt (ChatML format for Qwen/compatible models)
     prompt = ""
     for msg in request.messages:
         prompt += f"<|im_start|>{msg.role}\n{msg.content}<|im_end|>\n"
     prompt += "<|im_start|>assistant\n"
+    
+    logger.debug(f"[{request_id}] Formatted prompt length: {len(prompt)} chars")
 
     # Encode and check length
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     input_length = input_ids.shape[1]
     
+    logger.info(f"[{request_id}] Input tokens: {input_length}")
+    
     # Truncate input if too long (keep last MAX_PROMPT_LEN tokens)
     if input_length > MAX_PROMPT_LEN:
         input_ids = input_ids[:, -MAX_PROMPT_LEN:]
         input_length = MAX_PROMPT_LEN
-        print(f"[WARN] Input truncated to {MAX_PROMPT_LEN} tokens")
+        logger.warning(f"[{request_id}] Input truncated to {MAX_PROMPT_LEN} tokens")
     
     # Cap max_new_tokens to stay within context limit
     available_tokens = MAX_CONTEXT_LEN - input_length - 10  # Leave some buffer
@@ -397,6 +454,8 @@ async def chat_completions(request: ChatCompletionRequest):
     max_output_cap = 2000 if is_lunar_lake() else 500
     max_new_tokens = min(request.max_tokens or 512, available_tokens, max_output_cap)
     max_new_tokens = max(max_new_tokens, 10)  # At least 10 tokens
+    
+    logger.info(f"[{request_id}] Max new tokens: {max_new_tokens} (available: {available_tokens})")
     
     # Generation config for NPU (hardware-optimized)
     gen_kwargs = dict(
@@ -408,26 +467,39 @@ async def chat_completions(request: ChatCompletionRequest):
     # Add temperature if sampling is enabled (Lunar Lake)
     if npu_config['do_sample']:
         gen_kwargs['temperature'] = request.temperature
+    
+    logger.debug(f"[{request_id}] Generation config: {gen_kwargs}")
 
     # --- Streaming Response ---
     if request.stream:
+        logger.info(f"[{request_id}] Starting streaming generation")
         streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
         gen_kwargs["streamer"] = streamer
         
         def generate_in_thread():
             try:
+                gen_start = time.time()
                 model.generate(input_ids, **gen_kwargs)
+                gen_duration = time.time() - gen_start
+                logger.info(f"[{request_id}] Generation completed in {gen_duration:.2f}s")
             except Exception as e:
-                print(f"[ERROR] Generation failed: {e}")
+                logger.error(f"[{request_id}] Generation failed: {e}", exc_info=True)
         
         thread = Thread(target=generate_in_thread)
         thread.start()
 
         async def stream_generator():
-            request_id = f"chatcmpl-{uuid.uuid4()}"
+            stream_id = f"chatcmpl-{uuid.uuid4()}"
+            chunk_count = 0
+            total_chars = 0
+            
             for text in streamer:
+                chunk_count += 1
+                total_chars += len(text)
+                logger.debug(f"[{request_id}] Chunk {chunk_count}: {len(text)} chars")
+                
                 chunk = {
-                    "id": request_id,
+                    "id": stream_id,
                     "object": "chat.completion.chunk",
                     "created": int(time.time()),
                     "model": request.model,
@@ -435,8 +507,10 @@ async def chat_completions(request: ChatCompletionRequest):
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
             
+            logger.info(f"[{request_id}] Stream complete: {chunk_count} chunks, {total_chars} total chars")
+            
             end_chunk = {
-                "id": request_id,
+                "id": stream_id,
                 "object": "chat.completion.chunk",
                 "created": int(time.time()),
                 "model": request.model,
@@ -449,10 +523,20 @@ async def chat_completions(request: ChatCompletionRequest):
 
     # --- Standard Response ---
     else:
+        logger.info(f"[{request_id}] Starting non-streaming generation")
+        gen_start = time.time()
+        
         with torch.no_grad():
             output_ids = model.generate(input_ids, **gen_kwargs)
         
+        gen_duration = time.time() - gen_start
+        output_length = output_ids.shape[1] - input_ids.shape[1]
+        
         generated_text = tokenizer.decode(output_ids[0][input_ids.shape[1]:], skip_special_tokens=True)
+        
+        logger.info(f"[{request_id}] Generation complete: {output_length} tokens in {gen_duration:.2f}s")
+        logger.info(f"[{request_id}] Tokens/sec: {output_length/gen_duration:.2f}")
+        logger.debug(f"[{request_id}] Response preview: {generated_text[:200]}...")
 
         return ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4()}",
@@ -473,6 +557,12 @@ async def create_response(request: ResponseRequest):
     OpenAI Responses API endpoint (for N8N compatibility).
     Converts Responses API format to internal format and returns response.
     """
+    request_id = str(uuid.uuid4())[:8]
+    logger.info(f"[{request_id}] === Responses API Request ===")
+    logger.info(f"[{request_id}] Model: {request.model}")
+    logger.info(f"[{request_id}] Input type: {type(request.input).__name__}")
+    logger.debug(f"[{request_id}] Instructions: {request.instructions}")
+    
     model, tokenizer = get_model_and_tokenizer(request.model)
     
     # NPU model context limits
@@ -577,7 +667,28 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, default=8000, help="Port to run server on")
     parser.add_argument("--list", action="store_true", help="List available models and exit")
+    parser.add_argument(
+        "--verbose", 
+        action="store_true", 
+        help="Enable verbose debug logging (shows request details, tokens, generation info)"
+    )
+    parser.add_argument(
+        "--quiet", 
+        action="store_true", 
+        help="Minimal logging (errors and warnings only)"
+    )
     args = parser.parse_args()
+    
+    # Configure logging based on verbosity
+    if args.quiet:
+        logging.basicConfig(
+            level=logging.WARNING,
+            format='%(asctime)s [%(levelname)s] %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        logger = logging.getLogger(__name__)
+    else:
+        logger = configure_logging(verbose=args.verbose)
     
     if args.list:
         print("\nAvailable Models:")

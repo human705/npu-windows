@@ -15,6 +15,8 @@ REM Usage:
 REM   start_backend.bat              - Load default models
 REM   start_backend.bat --list       - Show all available models
 REM   start_backend.bat --models X   - Load specific models
+REM   start_backend.bat --verbose    - Enable detailed debug logging
+REM   start_backend.bat --quiet      - Minimal logging (errors only)
 
 echo ========================================
 echo   Intel NPU LLM Backend Server
